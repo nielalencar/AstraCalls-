@@ -727,7 +727,7 @@ func recordingNoteContent(rec callRecordingRow) string {
 	} else if dir == "inbound" {
 		dir = "Recebida"
 	}
-	return fmt.Sprintf("Gravacao de chamada WhatsApp\n\nDirecao: %s\nDuracao: %s\nOperador: %s\nSessao AstraCalls: %s\nCall ID: %s\n\nArquivo anexado automaticamente pelo AstraCalls.",
+	return fmt.Sprintf("Gravacao de chamada WhatsApp\n\nDirecao: %s\nDuracao: %s\nOperador: %s\nSessao: %s\nCall ID: %s\n\nArquivo anexado automaticamente.",
 		firstNonEmpty(dir, rec.Direction), formatDurationMS(rec.DurationMs), firstNonEmpty(rec.Owner, "-"), rec.SessionID, rec.CallID)
 }
 
