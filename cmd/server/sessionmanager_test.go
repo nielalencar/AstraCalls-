@@ -14,7 +14,8 @@ import (
 
 func newTestManager(t *testing.T) *SessionManager {
 	t.Helper()
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	dbPath := filepath.Join(t.TempDir(), "mgr_test.db")
 	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
 	if err != nil {
@@ -22,15 +23,11 @@ func newTestManager(t *testing.T) *SessionManager {
 	}
 	t.Cleanup(func() { db.Close() })
 
-	container := sqlstore.NewWithDB(db, "sqlite3", waLog.Noop)
-	if err := container.Upgrade(ctx); err != nil {
-		t.Fatal(err)
-	}
 	store, err := newSessionStore(ctx, db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return newSessionManager(ctx, container, NewBroker(), store, waLog.Noop, slog.Default(), 0)
+	return newSessionManager(ctx, nil, NewBroker(), store, waLog.Noop, slog.Default(), 0)
 }
 
 func (m *SessionManager) addUnconnected(t *testing.T, name string) *Session {
@@ -39,8 +36,20 @@ func (m *SessionManager) addUnconnected(t *testing.T, name string) *Session {
 	if err := m.store.insert(m.appCtx, id, name); err != nil {
 		t.Fatal(err)
 	}
-	client := whatsmeow.NewClient(m.container.NewDevice(), waLog.Noop)
+	dbPath := filepath.Join(t.TempDir(), "wa_store.db")
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	container := sqlstore.NewWithDB(db, "sqlite3", waLog.Noop)
+	if err := container.Upgrade(m.appCtx); err != nil {
+		t.Fatal(err)
+	}
+	client := whatsmeow.NewClient(container.NewDevice(), waLog.Noop)
 	s := newSession(m, id, name, client)
+	s.waContainer = container
+	s.waDB = db
 	m.register(s)
 	return s
 }

@@ -123,7 +123,13 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 	}
 	cm.OnPeerAudio = func(pcm16 []float32) {
 		ac, ok := s.reg.get(callID)
-		if !ok || ac.bridge == nil || ac.browserOpus == nil {
+		if !ok {
+			return
+		}
+		if ac.recorder != nil {
+			ac.recorder.WritePeerPCM16(pcm16)
+		}
+		if ac.bridge == nil || ac.browserOpus == nil {
 			return
 		}
 		pcm48 := media.Upsample16to48(pcm16)
@@ -133,6 +139,71 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		}
 		_ = ac.bridge.WriteOpus(opus, 60*time.Millisecond)
 	}
+}
+
+func (s *Session) startRecordingForCall(callID, direction, peer, owner string, requested bool, cw CallChatwootContext) {
+	cfg := recordingConfigFromEnv()
+	if !cfg.shouldRecord(requested) {
+		return
+	}
+	ac, ok := s.reg.get(callID)
+	if !ok || ac.recorder != nil {
+		return
+	}
+	phone := normalizeChatwootPhone(peer)
+	if jid, err := types.ParseJID(peer); err == nil {
+		phone = normalizeChatwootPhone(jid.User)
+	}
+	sourceID := cw.SourceID
+	if sourceID == "" {
+		sourceID = buildChatwootSourceID(s.id, phone, chatwootRuntime().SourceStrategy)
+	}
+	chatCfg := s.getChatwoot()
+	accountID, inboxID := cw.AccountID, cw.InboxID
+	if accountID == 0 {
+		accountID = chatCfg.AccountID
+	}
+	if inboxID == 0 {
+		inboxID = chatCfg.InboxID
+	}
+	meta := RecordingMeta{
+		SessionID:              s.id,
+		CallID:                 callID,
+		Direction:              direction,
+		Peer:                   peer,
+		Phone:                  phone,
+		SourceID:               sourceID,
+		Owner:                  owner,
+		ChatwootAccountID:      accountID,
+		ChatwootInboxID:        inboxID,
+		ChatwootContactID:      cw.ContactID,
+		ChatwootConversationID: cw.ConversationID,
+	}
+	recorder, err := NewCallRecorder(cfg, meta)
+	if err != nil {
+		s.log.Error("recording_started failed", "call_id", callID, "err", err)
+		_ = s.mgr.store.createCallRecording(s.mgr.appCtx, callRecordingRow{
+			ID: newStoreID(), SessionID: s.id, CallID: callID, Direction: direction, Peer: peer, Phone: phone,
+			SourceID: sourceID, Owner: owner, ChatwootAccountID: accountID, ChatwootInboxID: inboxID,
+			ChatwootContactID: cw.ContactID, ChatwootConversationID: cw.ConversationID,
+			Status: recordingStatusFailed, Error: err.Error(), StartedAt: time.Now().UnixMilli(),
+		})
+		return
+	}
+	recID := newStoreID()
+	ac.recorder = recorder
+	ac.recordingID = recID
+	ac.recording = meta
+	if err := s.mgr.store.createCallRecording(s.mgr.appCtx, callRecordingRow{
+		ID: recID, SessionID: s.id, CallID: callID, Direction: direction, Peer: peer, Phone: phone,
+		SourceID: sourceID, Owner: owner, ChatwootAccountID: accountID, ChatwootInboxID: inboxID,
+		ChatwootContactID: cw.ContactID, ChatwootConversationID: cw.ConversationID,
+		Status: recordingStatusRecording, FilePath: recorder.filePath, FileName: recorder.fileName,
+		MimeType: "audio/wav", StartedAt: recorder.startedAt.UnixMilli(),
+	}); err != nil {
+		s.log.Error("recording_started persistence failed", "call_id", callID, "err", err)
+	}
+	s.log.Info("recording_started", "call_id", callID, "file", recorder.filePath)
 }
 
 func (s *Session) startOutgoing(ctx context.Context, peer types.JID, isVideo bool) (string, error) {
@@ -298,6 +369,7 @@ func (s *Session) removeCall(callID string) {
 	if !ok {
 		return
 	}
+	s.finalizeRecording(callID, ac)
 	if ac.bridge != nil {
 		ac.bridge.Close()
 	}
@@ -317,6 +389,7 @@ func (s *Session) terminateCall(callID string, reason core.EndCallReason) {
 func (s *Session) teardownAllCalls() {
 	for _, ac := range s.reg.drain() {
 		_ = ac.cm.EndCall(context.Background(), core.EndCallReasonUserEnded)
+		s.finalizeRecording("", ac)
 		if ac.bridge != nil {
 			ac.bridge.Close()
 		}
@@ -324,6 +397,30 @@ func (s *Session) teardownAllCalls() {
 			ac.browserOpus.Close()
 		}
 	}
+}
+
+func (s *Session) finalizeRecording(callID string, ac *activeCall) {
+	if ac == nil || ac.recorder == nil || ac.recordingID == "" {
+		return
+	}
+	recorder := ac.recorder
+	ac.recorder = nil
+	_ = s.mgr.store.updateCallRecordingFailed(s.mgr.appCtx, ac.recordingID, recordingStatusFinalizing, "")
+	result, err := recorder.Stop()
+	if err != nil {
+		msg := err.Error()
+		_ = s.mgr.store.updateCallRecordingFailed(s.mgr.appCtx, ac.recordingID, recordingStatusFailed, msg)
+		s.log.Error("recording_finalized failed", "call_id", firstNonEmpty(callID, ac.recording.CallID), "err", err)
+		return
+	}
+	if result == nil {
+		return
+	}
+	if err := s.mgr.store.updateCallRecordingSaved(s.mgr.appCtx, ac.recordingID, *result); err != nil {
+		s.log.Error("recording_finalized persistence failed", "call_id", firstNonEmpty(callID, ac.recording.CallID), "err", err)
+	}
+	s.log.Info("recording_finalized", "call_id", firstNonEmpty(callID, ac.recording.CallID), "file", result.FilePath, "duration_ms", result.DurationMs, "size_bytes", result.SizeBytes, "drops", result.Drops)
+	go s.mgr.uploadCallRecordingByID(ac.recordingID)
 }
 
 func (s *Session) replaceClient(client *whatsmeow.Client) {

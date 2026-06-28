@@ -14,6 +14,8 @@ wacalls.db
 *.db-shm
 /auth/
 /data/
+/recordings/
+stack_em_producao*
 client/node_modules/
 client/dist/
 client/.vite/

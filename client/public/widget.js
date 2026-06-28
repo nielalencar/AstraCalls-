@@ -215,7 +215,18 @@
       };
       var r = await api("/api/sessions/" + state.session + "/calls", {
         method: "POST",
-        body: { phone: state.phone, duration_ms: 300000, record: false },
+        body: {
+          phone: state.phone,
+          duration_ms: 300000,
+          record: true,
+          chatwoot: {
+            account_id: state.account_id || 0,
+            inbox_id: state.inbox_id || 0,
+            contact_id: state.contact_id || 0,
+            conversation_id: state.conversation_id || 0,
+            source_id: state.source_id || "",
+          },
+        },
       });
       var callId = r.call.callId;
       var offer = await pc.createOffer();
@@ -402,7 +413,11 @@
     api("/api/chatwoot/resolve?account_id=" + parts[0] + "&conversation_id=" + parts[1])
       .then(function (info) {
         if (convKey() !== key) return; // o agente já trocou de conversa
-        resolved = { session: info.session_id, phone: info.phone, name: info.name || info.phone };
+        resolved = {
+          session: info.session_id, phone: info.phone, name: info.name || info.phone,
+          account_id: info.account_id, inbox_id: info.inbox_id, contact_id: info.contact_id,
+          conversation_id: info.conversation_id, source_id: info.source_id,
+        };
         callable = true;
         ensureButton();
       })
@@ -435,7 +450,11 @@
     var parts = key.split("/");
     api("/api/chatwoot/resolve?account_id=" + parts[0] + "&conversation_id=" + parts[1])
       .then(function (info) {
-        resolved = { session: info.session_id, phone: info.phone, name: info.name || info.phone };
+        resolved = {
+          session: info.session_id, phone: info.phone, name: info.name || info.phone,
+          account_id: info.account_id, inbox_id: info.inbox_id, contact_id: info.contact_id,
+          conversation_id: info.conversation_id, source_id: info.source_id,
+        };
         callable = true;
         render({ session: resolved.session, phone: resolved.phone, name: resolved.name });
       })

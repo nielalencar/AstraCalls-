@@ -1,27 +1,28 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
-func TestOpenDBConcurrencyConfig(t *testing.T) {
-	db, err := openDB(filepath.Join(t.TempDir(), "concurrency.db"))
+func TestSessionStoreCreatesChatwootTables(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "chatwoot_tables.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 
-	if got := db.Stats().MaxOpenConnections; got != 1 {
-		t.Fatalf("expected pool capped to 1 connection, got %d", got)
-	}
-
-	var mode string
-	if err := db.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil {
+	if _, err := newSessionStore(ctx, db); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.EqualFold(mode, "wal") {
-		t.Fatalf("expected WAL journal mode, got %q", mode)
+
+	for _, table := range []string{"chatwoot_contact_links", "chatwoot_message_dedup", "chatwoot_outbox", "call_recordings"} {
+		var name string
+		if err := db.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name = $1`, table).Scan(&name); err != nil {
+			t.Fatalf("table %s was not created: %v", table, err)
+		}
 	}
 }

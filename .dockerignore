@@ -8,3 +8,4 @@ wacalls-mlow
 server.log
 caddy.log
 Caddyfile
+stack_em_producao*

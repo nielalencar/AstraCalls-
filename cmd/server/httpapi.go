@@ -28,6 +28,8 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/accept", s.handleAccept)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/reject", s.handleReject)
 	mux.HandleFunc("DELETE /api/sessions/{sid}/calls/{id}", s.handleEndCall)
+	mux.HandleFunc("GET /api/sessions/{sid}/calls/{id}/recording", s.handleRecording)
+	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/recording/retry-upload", s.handleRecordingRetry)
 	mux.HandleFunc("GET /api/sessions/{sid}/history", s.handleHistory)
 
 	// Mensageria (whatsmeow)
@@ -124,8 +126,15 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	rcfg := recordingConfigFromEnv()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"maxCallsPerSession": s.sessions.maxCalls,
+		"recordings": map[string]any{
+			"enabled":     rcfg.Enabled,
+			"mode":        rcfg.Mode,
+			"format":      rcfg.Format,
+			"privateNote": rcfg.PrivateNote,
+		},
 	})
 }
 
@@ -221,6 +230,37 @@ func (s *server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *server) handleRecording(w http.ResponseWriter, r *http.Request) {
+	if sess := s.sessionByID(w, r.PathValue("sid")); sess != nil {
+		rec, err := s.sessions.store.getCallRecording(r.Context(), sess.id, r.PathValue("id"))
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		if rec == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "recording not found"})
+			return
+		}
+		writeJSON(w, http.StatusOK, rec)
+	}
+}
+
+func (s *server) handleRecordingRetry(w http.ResponseWriter, r *http.Request) {
+	if sess := s.sessionByID(w, r.PathValue("sid")); sess != nil {
+		rec, err := s.sessions.store.getCallRecording(r.Context(), sess.id, r.PathValue("id"))
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		if rec == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "recording not found"})
+			return
+		}
+		go s.sessions.uploadCallRecordingByID(rec.ID)
+		writeJSON(w, http.StatusOK, map[string]string{"status": "queued"})
+	}
+}
+
 func (s *server) doStartCall(sess *Session, w http.ResponseWriter, r *http.Request) {
 	if sess.client.Store.ID == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "not paired"})
@@ -230,6 +270,7 @@ func (s *server) doStartCall(sess *Session, w http.ResponseWriter, r *http.Reque
 		Phone      string `json:"phone"`
 		DurationMs int    `json:"duration_ms"`
 		Record     bool   `json:"record"`
+		Chatwoot   CallChatwootContext `json:"chatwoot"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Phone) == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "phone required"})
@@ -249,11 +290,21 @@ func (s *server) doStartCall(sess *Session, w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	sess.startRecordingForCall(callID, "outbound", peer.String(), owner, body.Record, body.Chatwoot)
 	s.broker.upsertCall(CallRecord{
 		SessionID: sess.id, CallID: callID, Owner: &owner, Direction: "outbound", Peer: peer.String(),
 		StartedAt: time.Now().UnixMilli(), Status: StatusRinging,
 	})
-	writeJSON(w, http.StatusOK, map[string]any{"call": map[string]string{"callId": callID}})
+	recEnabled := false
+	recStatus := ""
+	if ac, ok := sess.reg.get(callID); ok && ac.recorder != nil {
+		recEnabled = true
+		recStatus = recordingStatusRecording
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"call": map[string]string{"callId": callID},
+		"recording": map[string]any{"enabled": recEnabled, "status": recStatus},
+	})
 }
 
 func (s *server) doWebRTC(sess *Session, w http.ResponseWriter, r *http.Request) {
@@ -289,7 +340,11 @@ func (s *server) doWebRTC(sess *Session, w http.ResponseWriter, r *http.Request)
 		if err != nil {
 			return
 		}
-		ac.cm.FeedCapturedPCM(media.Downsample48to16(pcm48))
+		pcm16 := media.Downsample48to16(pcm48)
+		if ac.recorder != nil {
+			ac.recorder.WriteOperatorPCM16(pcm16)
+		}
+		ac.cm.FeedCapturedPCM(pcm16)
 	}
 	bridge.OnTerminalICE = func() {
 		go sess.terminateCall(callID, core.EndCallReasonUserEnded)
@@ -314,6 +369,15 @@ func (s *server) doAccept(sess *Session, w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "claimed by another client"})
 		return
 	}
+	if ac.recordingID != "" {
+		ac.recording.Owner = owner
+		_ = sess.mgr.store.updateCallRecordingOwner(r.Context(), ac.recordingID, owner)
+	}
+	peer := ""
+	if rec, ok := s.broker.getCall(id); ok && rec != nil {
+		peer = rec.Peer
+	}
+	sess.startRecordingForCall(id, "inbound", peer, owner, false, CallChatwootContext{})
 	s.broker.emitIncomingClaimed(sess.id, id, owner)
 	if err := ac.cm.AcceptCall(r.Context(), id); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})

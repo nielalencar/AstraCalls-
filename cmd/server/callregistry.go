@@ -11,6 +11,9 @@ type activeCall struct {
 	cm          *call.CallManager
 	bridge      *Bridge
 	browserOpus media.Codec
+	recorder    *CallRecorder
+	recordingID string
+	recording   RecordingMeta
 }
 
 type callRegistry struct {

@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
+	"time"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
@@ -24,6 +26,9 @@ type SessionManager struct {
 	mu       sync.RWMutex
 	sessions map[string]*Session
 	order    []string
+	cwLocks  sync.Map
+	cwWorker sync.Once
+	recWorker sync.Once
 }
 
 func newSessionManager(ctx context.Context, db *dbProvider, broker *Broker, store *sessionStore, waLogger waLog.Logger, log *slog.Logger, maxCalls int) *SessionManager {
@@ -157,6 +162,8 @@ func (m *SessionManager) Restore(ctx context.Context) error {
 	}
 	m.broker.emitSessionList(m.infos())
 	m.log.Info("sessions restored", "count", len(m.infos()))
+	m.startChatwootOutboxWorker()
+	m.startRecordingUploadWorker()
 	return nil
 }
 
@@ -255,5 +262,110 @@ func (m *SessionManager) disconnectAll() {
 	m.mu.RUnlock()
 	for _, s := range all {
 		s.shutdown()
+	}
+}
+
+func (m *SessionManager) chatwootLock(key string) func() {
+	v, _ := m.cwLocks.LoadOrStore(key, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return func() { mu.Unlock() }
+}
+
+func (m *SessionManager) startChatwootOutboxWorker() {
+	m.cwWorker.Do(func() {
+		go m.chatwootOutboxLoop()
+	})
+}
+
+func (m *SessionManager) startRecordingUploadWorker() {
+	m.recWorker.Do(func() {
+		go m.recordingUploadLoop()
+	})
+}
+
+func (m *SessionManager) chatwootOutboxLoop() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.appCtx.Done():
+			return
+		case <-ticker.C:
+			m.drainChatwootOutbox()
+		}
+	}
+}
+
+func (m *SessionManager) drainChatwootOutbox() {
+	for i := 0; i < 10; i++ {
+		it, err := m.store.claimNextChatwootOutbox(m.appCtx, time.Now().UnixMilli())
+		if err != nil {
+			m.log.Error("chatwoot: claim outbox failed", "err", err)
+			return
+		}
+		if it == nil {
+			return
+		}
+		m.processChatwootOutboxItem(*it)
+	}
+}
+
+func (m *SessionManager) recordingUploadLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.appCtx.Done():
+			return
+		case <-ticker.C:
+			m.drainRecordingUploads()
+			m.cleanupExpiredRecordings()
+		}
+	}
+}
+
+func (m *SessionManager) drainRecordingUploads() {
+	if !recordingConfigFromEnv().UploadRetry {
+		return
+	}
+	rows, err := m.store.listCallRecordingsForUpload(m.appCtx, time.Now().UnixMilli(), 10)
+	if err != nil {
+		m.log.Error("recording retry query failed", "err", err)
+		return
+	}
+	for _, rec := range rows {
+		m.uploadCallRecording(rec)
+	}
+}
+
+func (m *SessionManager) uploadCallRecordingByID(id string) {
+	rec, err := m.store.getCallRecordingByID(m.appCtx, id)
+	if err != nil {
+		m.log.Error("recording upload lookup failed", "recording_id", id, "err", err)
+		return
+	}
+	if rec == nil {
+		return
+	}
+	m.uploadCallRecording(*rec)
+}
+
+func (m *SessionManager) cleanupExpiredRecordings() {
+	cfg := recordingConfigFromEnv()
+	if cfg.RetentionDays <= 0 {
+		return
+	}
+	cutoff := time.Now().Add(-time.Duration(cfg.RetentionDays) * 24 * time.Hour).UnixMilli()
+	rows, err := m.store.listExpiredRecordingFiles(m.appCtx, cutoff, 20)
+	if err != nil {
+		m.log.Error("recording cleanup query failed", "err", err)
+		return
+	}
+	for _, rec := range rows {
+		if rec.FilePath != "" {
+			_ = os.Remove(rec.FilePath)
+		}
+		_ = m.store.markRecordingFileRemoved(m.appCtx, rec.ID)
 	}
 }
