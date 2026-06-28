@@ -150,12 +150,9 @@ func (s *Session) startRecordingForCall(callID, direction, peer, owner string, r
 	if !ok || ac.recorder != nil {
 		return
 	}
-	phone := normalizeChatwootPhone(peer)
-	if jid, err := types.ParseJID(peer); err == nil {
-		phone = normalizeChatwootPhone(jid.User)
-	}
+	phone := s.chatwootPhoneForPeer(peer)
 	sourceID := cw.SourceID
-	if sourceID == "" {
+	if sourceID == "" && phone != "" {
 		sourceID = buildChatwootSourceID(s.id, phone, chatwootRuntime().SourceStrategy)
 	}
 	chatCfg := s.getChatwoot()
@@ -204,6 +201,22 @@ func (s *Session) startRecordingForCall(callID, direction, peer, owner string, r
 		s.log.Error("recording_started persistence failed", "call_id", callID, "err", err)
 	}
 	s.log.Info("recording_started", "call_id", callID, "file", recorder.filePath)
+}
+
+func (s *Session) chatwootPhoneForPeer(peer string) string {
+	if jid, err := types.ParseJID(peer); err == nil {
+		if jid.Server == types.DefaultUserServer {
+			return normalizeChatwootPhone(jid.User)
+		}
+		if s != nil && s.client != nil && s.client.Store != nil {
+			phone := normalizeChatwootPhone(s.realPhone(jid))
+			if phone != "" && phone != normalizeChatwootPhone(jid.User) {
+				return phone
+			}
+		}
+		return ""
+	}
+	return normalizeChatwootPhone(peer)
 }
 
 func (s *Session) startOutgoing(ctx context.Context, peer types.JID, isVideo bool) (string, error) {

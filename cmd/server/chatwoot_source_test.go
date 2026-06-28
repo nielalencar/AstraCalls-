@@ -20,6 +20,28 @@ func TestChatwootSourceIDStrategies(t *testing.T) {
 	}
 }
 
+func TestChatwootPhoneForPeerDoesNotTreatLIDAsPhone(t *testing.T) {
+	sess := &Session{}
+	if got := sess.chatwootPhoneForPeer("273422517063840@lid"); got != "" {
+		t.Fatalf("lid must not be treated as phone: %q", got)
+	}
+	if got := sess.chatwootPhoneForPeer("555189632063@s.whatsapp.net"); got != "555189632063" {
+		t.Fatalf("unexpected phone jid: %q", got)
+	}
+}
+
+func TestChatwootSourceIDMatchesPhone(t *testing.T) {
+	if !chatwootSourceIDMatchesPhone("astra:s1:555189632063", "555189632063") {
+		t.Fatal("expected astra source id to match phone")
+	}
+	if !chatwootSourceIDMatchesPhone("whatsapp:555189632063", "555189632063") {
+		t.Fatal("expected phone_only source id to match phone")
+	}
+	if chatwootSourceIDMatchesPhone("astra:s1:273422517063840", "555189632063") {
+		t.Fatal("must not reuse source id built from a lid")
+	}
+}
+
 func TestChatwootOutboxDedupRoundtrip(t *testing.T) {
 	ctx := context.Background()
 	db, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "dedup.db"))

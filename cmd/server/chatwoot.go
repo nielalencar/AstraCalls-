@@ -52,11 +52,11 @@ var cwHTTP = &http.Client{Timeout: 30 * time.Second}
 var errChatwootDuplicate = errors.New("chatwoot duplicate message")
 
 type chatwootRuntimeConfig struct {
-	ReopenResolved  bool
-	SourceStrategy  string
+	ReopenResolved   bool
+	SourceStrategy   string
 	ReopenWindowDays int
-	UseLocalCache   bool
-	DedupEnabled    bool
+	UseLocalCache    bool
+	DedupEnabled     bool
 }
 
 type chatwootConversation struct {
@@ -71,11 +71,11 @@ type chatwootConversation struct {
 
 func chatwootRuntime() chatwootRuntimeConfig {
 	return chatwootRuntimeConfig{
-		ReopenResolved:  envBool("CHATWOOT_REOPEN_RESOLVED_CONVERSATION", true),
-		SourceStrategy:  envStr("CHATWOOT_SOURCE_ID_STRATEGY", cwDefaultSourceIDStrategy),
+		ReopenResolved:   envBool("CHATWOOT_REOPEN_RESOLVED_CONVERSATION", true),
+		SourceStrategy:   envStr("CHATWOOT_SOURCE_ID_STRATEGY", cwDefaultSourceIDStrategy),
 		ReopenWindowDays: envInt("CHATWOOT_REOPEN_WINDOW_DAYS", 0),
-		UseLocalCache:   envBool("CHATWOOT_USE_LOCAL_CONVERSATION_CACHE", true),
-		DedupEnabled:    envBool("CHATWOOT_DEDUP_ENABLED", true),
+		UseLocalCache:    envBool("CHATWOOT_USE_LOCAL_CONVERSATION_CACHE", true),
+		DedupEnabled:     envBool("CHATWOOT_DEDUP_ENABLED", true),
 	}
 }
 
@@ -145,6 +145,9 @@ func (s *Session) realPhone(jid types.JID) string {
 		return ""
 	}
 	if jid.Server == types.DefaultUserServer {
+		return jid.User
+	}
+	if s.client == nil || s.client.Store == nil || s.client.Store.LIDs == nil {
 		return jid.User
 	}
 	if pn, err := s.client.Store.LIDs.GetPNForLID(context.Background(), jid); err == nil && pn.User != "" {
@@ -256,8 +259,8 @@ func (c ChatwootConfig) ensureContact(chatID, phone, name, avatarURL, wantedSour
 		"identifier":   chatID,
 		"source_id":    wantedSourceID,
 		"custom_attributes": map[string]any{
-			cwChatIDAttr:          chatID,
-			"source":              "astracalls",
+			cwChatIDAttr:           chatID,
+			"source":               "astracalls",
 			"astracalls_source_id": wantedSourceID,
 		},
 	}
@@ -684,16 +687,24 @@ func (m *SessionManager) resolveRecordingConversation(sess *Session, cfg Chatwoo
 			return conv.ID, firstNonZero(rec.ChatwootContactID, conv.ContactID), firstNonEmpty(rec.SourceID, conv.SourceID), nil
 		}
 	}
-	phone := normalizeChatwootPhone(rec.Phone)
-	if phone == "" {
-		if jid, err := types.ParseJID(rec.Peer); err == nil {
-			phone = normalizeChatwootPhone(jid.User)
-		}
+	phone := ""
+	peerIsNonPhoneJID := false
+	if jid, err := types.ParseJID(rec.Peer); err == nil {
+		peerIsNonPhoneJID = jid.Server != types.DefaultUserServer
+	}
+	if sess != nil {
+		phone = sess.chatwootPhoneForPeer(rec.Peer)
+	}
+	if phone == "" && !peerIsNonPhoneJID {
+		phone = normalizeChatwootPhone(rec.Phone)
 	}
 	if phone == "" {
 		return 0, 0, "", fmt.Errorf("recording has no phone")
 	}
-	sourceID := firstNonEmpty(rec.SourceID, buildChatwootSourceID(rec.SessionID, phone, chatwootRuntime().SourceStrategy))
+	sourceID := buildChatwootSourceID(rec.SessionID, phone, chatwootRuntime().SourceStrategy)
+	if chatwootSourceIDMatchesPhone(rec.SourceID, phone) {
+		sourceID = rec.SourceID
+	}
 	if link, err := m.store.findChatwootContactLink(m.appCtx, rec.SessionID, phone, cfg.AccountID, cfg.InboxID); err == nil && link != nil {
 		if link.ChatwootConversationID != 0 {
 			return link.ChatwootConversationID, link.ChatwootContactID, firstNonEmpty(link.SourceID, sourceID), nil
@@ -718,6 +729,13 @@ func (m *SessionManager) resolveRecordingConversation(sess *Session, cfg Chatwoo
 		LastConversationStatus: firstNonEmpty(conv.Status, "open"), LastMessageAt: time.Now().UnixMilli(),
 	})
 	return conv.ID, contactID, actualSourceID, nil
+}
+
+func chatwootSourceIDMatchesPhone(sourceID, phone string) bool {
+	if sourceID == "" || phone == "" {
+		return false
+	}
+	return sourceID == "whatsapp:"+phone || strings.HasSuffix(sourceID, ":"+phone)
 }
 
 func recordingNoteContent(rec callRecordingRow) string {
